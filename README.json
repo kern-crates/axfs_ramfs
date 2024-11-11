@@ -1,0 +1,11 @@
+{
+  "name": "axfs_ramfs",
+  "description": "Ramfs.",
+  "authors": [{
+    "name": "Shi Lei",
+    "email": "shi_lei@massclouds.com"
+  }],
+  "keywords": ["fs", "ramfs"],
+  "repo": "shilei-massclouds/axfs_ramfs",
+  "doc_url": "https://github.com/shilei-massclouds/axfs_ramfs/blob/main/README.md"
+}
