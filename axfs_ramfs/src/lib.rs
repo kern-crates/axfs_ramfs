@@ -3,7 +3,10 @@
 //! The implementation is based on [`axfs_vfs`].
 
 #![cfg_attr(not(test), no_std)]
+#![feature(btree_cursors)]
 
+#[macro_use]
+extern crate log;
 extern crate alloc;
 
 mod dir;
@@ -16,8 +19,12 @@ pub use self::dir::DirNode;
 pub use self::file::FileNode;
 
 use alloc::sync::Arc;
-use axfs_vfs::{VfsNodeRef, VfsOps, VfsResult};
+use axfs_vfs::{VfsNodeRef, VfsOps, VfsResult, FileSystemInfo};
+use axfs_vfs::{VfsError, VfsNodeType};
 use spin::once::Once;
+use axtype::PAGE_SIZE;
+
+const RAMFS_MAGIC: u64 = 0x858458f6;
 
 /// A RAM filesystem that implements [`axfs_vfs::VfsOps`].
 pub struct RamFileSystem {
@@ -27,10 +34,10 @@ pub struct RamFileSystem {
 
 impl RamFileSystem {
     /// Create a new instance.
-    pub fn new() -> Self {
+    pub fn new(uid: u32, gid: u32, mode: i32) -> Self {
         Self {
             parent: Once::new(),
-            root: DirNode::new(None),
+            root: DirNode::new(None, uid, gid, mode),
         }
     }
 
@@ -53,10 +60,26 @@ impl VfsOps for RamFileSystem {
     fn root_dir(&self) -> VfsNodeRef {
         self.root.clone()
     }
+
+    fn statfs(&self) -> VfsResult<FileSystemInfo> {
+        let info = FileSystemInfo {
+            f_type: RAMFS_MAGIC,
+            f_bsize: PAGE_SIZE as u64,
+            ..Default::default()
+        };
+        Ok(info)
+    }
+
+    fn alloc_inode(&self, ty: VfsNodeType, uid: u32, gid: u32, mode: i32) -> VfsResult<VfsNodeRef> {
+        match ty {
+            VfsNodeType::File => Ok(Arc::new(FileNode::new(uid, gid, mode))),
+            _ => return Err(VfsError::Unsupported),
+        }
+    }
 }
 
 impl Default for RamFileSystem {
     fn default() -> Self {
-        Self::new()
+        Self::new(0, 0, 0)
     }
 }

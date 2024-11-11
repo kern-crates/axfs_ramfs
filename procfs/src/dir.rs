@@ -1,23 +1,18 @@
-use core::mem;
-use core::mem::transmute;
-use core::ptr::copy_nonoverlapping;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::{string::String, vec::Vec};
 use alloc::borrow::ToOwned;
 use axfs_vfs::alloc_ino;
 use axtype::{O_NOFOLLOW, S_ISGID};
-use axfs_devfs::ConsoleDev;
-
-use axfs_vfs::{VfsDirEntry, VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType};
-use axfs_vfs::{VfsError, VfsResult, DT_, LinuxDirent64};
-use axfs_vfs::VfsNodeAttrValid;
+use axfs_vfs::{VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType};
+use axfs_vfs::{VfsError, VfsResult};
 use spin::RwLock;
 
 use crate::file::{FileNode, SymLinkNode};
-use pipefs::PipeNode;
 
-/// The directory node in the RAM filesystem.
+pub type LookupOp = fn(&str, i32) -> VfsResult<VfsNodeRef>;
+
+/// The directory node in the Proc filesystem.
 ///
 /// It implements [`axfs_vfs::VfsNodeOps`].
 pub struct DirNode {
@@ -28,10 +23,13 @@ pub struct DirNode {
     uid: RwLock<u32>,
     gid: RwLock<u32>,
     mode: RwLock<i32>,
+    lookup_op: Option<LookupOp>,
 }
 
 impl DirNode {
-    pub(super) fn new(parent: Option<Weak<dyn VfsNodeOps>>, uid: u32, gid: u32, mode: i32) -> Arc<Self> {
+    pub(super) fn new(
+        parent: Option<Weak<dyn VfsNodeOps>>, uid: u32, gid: u32, mode: i32, lookup_op: Option<LookupOp>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             parent: RwLock::new(parent.unwrap_or_else(|| Weak::<Self>::new())),
@@ -40,6 +38,7 @@ impl DirNode {
             uid: RwLock::new(uid),
             gid: RwLock::new(gid),
             mode: RwLock::new(mode),
+            lookup_op,
         })
     }
 
@@ -69,11 +68,9 @@ impl DirNode {
             gid = *self.gid.read();
         }
         let node: VfsNodeRef = match ty {
-            VfsNodeType::File => Arc::new(FileNode::new(uid, gid, mode)),
-            VfsNodeType::Dir => Self::new(Some(self.this.clone()), uid, gid, mode),
-            VfsNodeType::Fifo => Arc::new(PipeNode::new(uid, gid)),
+            VfsNodeType::File => Arc::new(FileNode::new(None, uid, gid, mode)),
+            VfsNodeType::Dir => Self::new(Some(self.this.clone()), uid, gid, mode, None),
             VfsNodeType::SymLink => Arc::new(SymLinkNode::new(uid, gid)),
-            VfsNodeType::CharDevice => Arc::new(ConsoleDev),
             _ => return Err(VfsError::Unsupported),
         };
         self.children.write().insert(name.into(), node.clone());
@@ -116,35 +113,36 @@ impl DirNode {
         let ret = node.read_at(0, &mut target).unwrap();
         assert!(ret < target.len());
         let target = core::str::from_utf8(&target[0..ret]).unwrap();
-        info!("SymLink to target: {}", target);
+        error!("SymLink to target: {}", target);
         Some(target.to_owned())
     }
 }
 
 impl VfsNodeOps for DirNode {
-    fn link(&self, path: &str, node: VfsNodeRef) -> VfsResult {
-        let (name, rest) = split_path(path);
-        if let Some(rest) = rest {
-            match name {
-                "" | "." => self.link(rest, node),
-                ".." => self.parent().ok_or(VfsError::NotFound)?.link(rest, node),
-                _ => {
-                    let subdir = self
-                        .children
-                        .read()
-                        .get(name)
-                        .ok_or(VfsError::NotFound)?
-                        .clone();
-                    subdir.link(rest, node)
-                }
-            }
-        } else if name.is_empty() || name == "." || name == ".." {
-            Ok(()) // already exists
-        } else {
-            self.fill_node(name, node)
-        }
+    fn get_ino(&self) -> usize {
+        self.ino
     }
 
+    // Todo: use it to replace `create(&self, )`.
+    fn create_child(&self, fname: &str, ty: VfsNodeType, uid: u32, gid: u32, mode: i32) -> VfsResult<VfsNodeRef> {
+        assert!(fname.find('/').is_none(), "bad filename {}", fname);
+        assert!(!fname.is_empty());
+        assert!(fname != ".");
+        assert!(fname != "..");
+        info!("create child [{:?}] '{}'", ty, fname);
+        self.create_node(fname, ty, uid, gid, mode)
+    }
+
+    fn link_child(&self, fname: &str, node: VfsNodeRef) -> VfsResult {
+        info!("link_child: {}", fname);
+        assert!(fname.find('/').is_none(), "bad filename {}", fname);
+        assert!(!fname.is_empty());
+        assert!(fname != ".");
+        assert!(fname != "..");
+        self.fill_node(fname, node)
+    }
+
+    /*
     fn symlink(&self, path: &str, target: &str, uid: u32, gid: u32, mode: i32) -> VfsResult {
         let (name, rest) = split_path(path);
         if let Some(rest) = rest {
@@ -169,10 +167,7 @@ impl VfsNodeOps for DirNode {
             Ok(())
         }
     }
-
-    fn get_ino(&self) -> usize {
-        self.ino
-    }
+    */
 
     fn get_attr(&self) -> VfsResult<VfsNodeAttr> {
         Ok(VfsNodeAttr::new_dir(
@@ -180,6 +175,7 @@ impl VfsNodeOps for DirNode {
         ))
     }
 
+    /*
     fn set_attr(&self, attr: &VfsNodeAttr, valid: &VfsNodeAttrValid) -> VfsResult {
         if valid.contains(VfsNodeAttrValid::ATTR_MODE) {
             *self.mode.write() = attr.mode();
@@ -196,9 +192,15 @@ impl VfsNodeOps for DirNode {
     fn parent(&self) -> Option<VfsNodeRef> {
         self.parent.read().upgrade()
     }
+    */
 
     fn lookup(self: Arc<Self>, path: &str, flags: i32) -> VfsResult<(VfsNodeRef, String)> {
         info!("lookup: {} flags {:#o}\n", path, flags);
+        if let Some(lookup_op) = self.lookup_op {
+            let node = lookup_op(path, flags)?;
+            return Ok((node, String::new()));
+        }
+
         let (name, rest) = split_path(path);
         let mut name = String::from(name);
         loop {
@@ -214,15 +216,12 @@ impl VfsNodeOps for DirNode {
             }?;
             debug!("name {} rest {:?} {} flags {:#o}", name, rest, node.get_attr()?.is_symlink(), flags);
             if let Some(linkname) = self.handle_symlink(node.clone(), flags, rest.is_none()) {
-                if linkname.starts_with("/") {
-                    info!("root path: {}", linkname);
-                    return Ok((node, linkname));
-                }
                 name = linkname;
                 continue;
             }
 
             if let Some(rest) = rest {
+                debug!("lookup: rest {}", rest);
                 return node.lookup(rest, flags);
             } else {
                 return Ok((node, String::new()));
@@ -230,6 +229,7 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    /*
     fn read_dir(&self, start_idx: usize, dirents: &mut [VfsDirEntry]) -> VfsResult<usize> {
         let children = self.children.read();
         let mut children = children.iter().skip(start_idx.max(2) - 2);
@@ -250,7 +250,7 @@ impl VfsNodeOps for DirNode {
     }
 
     fn create(&self, path: &str, ty: VfsNodeType, uid: u32, gid: u32, mode: i32) -> VfsResult {
-        log::info!("create {:?} at ramfs: {}", ty, path);
+        log::info!("create {:?} at procfs: {}", ty, path);
         let (name, rest) = split_path(path);
         if let Some(rest) = rest {
             match name {
@@ -282,7 +282,7 @@ impl VfsNodeOps for DirNode {
     }
 
     fn remove(&self, path: &str) -> VfsResult {
-        log::info!("remove at ramfs: {}", path);
+        log::info!("remove at procfs: {}", path);
         let (name, rest) = split_path(path);
         if let Some(rest) = rest {
             match name {
@@ -314,7 +314,7 @@ impl VfsNodeOps for DirNode {
 
     fn getdents(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if offset != 0 {
-            warn!("NOTICE! todo: check offset[{}] and real length of directory!", offset);
+            log::error!("NOTICE! todo: check offset[{}] and real length of directory!", offset);
             return Ok(0);
         }
 
@@ -377,6 +377,7 @@ impl VfsNodeOps for DirNode {
         }
         Ok(0)
     }
+    */
 
     axfs_vfs::impl_vfs_dir_default! {}
 }
